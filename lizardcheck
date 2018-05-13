@@ -1,0 +1,249 @@
+#!/usr/bin/python3
+
+#lizardcheck: a filter that checks for files with chunks with
+#badly-replicated chunks.
+#
+#Usage:
+#
+## list all critically-endangered files, i.e. with chunks with exactly one copy
+#find /mnt/lizard -type f -print0 | lizardcheck -n 0 -zb
+#
+## delete all files with missing chunks
+#find /mnt/lizard -type f -print0 | lizardcheck -n 0 -zZ | xargs -0r rm -f
+
+import os
+import sys
+import stat
+import time
+import click
+import errno
+import struct
+import socket
+
+Struct = struct.Struct
+VERSION = (3,12,0)
+
+FUSE_REGISTER_BLOB_ACL = b"DjI1GAQDULI5d2YjA26ypc3ovkhjvhciTQVx3CS4nYgtBoUcsljiVpsErJENHaw0"
+MASTER = ".masterinfo"
+
+SPECIAL_INODE_ROOT = 1
+PROTO_BASE = 0 ## LIGHT protocol version: 65536
+REGISTER_TOOLS = 4
+
+CLTOMA_FUSE_REGISTER = PROTO_BASE+400
+MATOCL_FUSE_REGISTER = PROTO_BASE+401
+
+CLTOMA_FUSE_CHECK = PROTO_BASE+440
+MATOCL_FUSE_CHECK = PROTO_BASE+441
+
+RETURN_REST = 1
+
+class StructV(Stuct):
+	def __init__(self, prefix,vect):
+		super().__init__(prefix)
+		self._v = Struct(vect)
+
+	def pack(*args):
+		v = args.pop()
+		buf = [ super().pack(*args) ]
+		for ve in v:
+			buf.append(v)
+		return b''.join(buf)
+
+def recv_all(s,l):
+	b=b""
+	while l:
+		rb = s.recv(l)
+		if not rb:
+			return b
+		b += rb
+		l -= len(rb)
+	return b
+
+class Lizard:
+	devno = None
+	sock = None
+	host = None
+	port = None
+	cuid = None
+	version = None
+	seq = 1
+	root_inode = None
+	root_path = None
+
+	def __init__(self, root=None, search=False):
+		if root is not None:
+			self.get_root(root, search=search)
+
+	def get_root_info(self, path, search=True):
+		st = os.stat(path)
+		while True:
+			try:
+				if stat.S_ISDIR(st.st_mode):
+					f = open(os.path.join(path, MASTER), 'rb')
+				else:
+					e = OSError()
+					e.errno = errno.ENOENT
+					raise e
+			except EnvironmentError as e:
+				if e.errno != errno.ENOENT:
+					raise
+				if not search:
+					raise
+				if path == "/":
+					raise
+				path,_ = os.path.split(path)
+				nst = os.stat(path)
+				if nst.st_dev != st.st_dev:
+					raise
+				st = nst
+			else:
+				try:
+					buf = f.read(14)
+					if len(buf) != 14:
+						raise RuntimeError("Could not read master info")
+					x = struct.unpack(">IHii", buf)
+					self.host,self.port,self.cuid,self.version = x
+
+					self.devno = st.st_dev
+					self.root_inode = st.st_ino
+					self.root_path = path
+					return
+				finally:
+					f.close()
+		
+	def get_root(self, path=None, search=True):
+		if path is None:
+			assert self.root_path is not None
+			search = False
+			path = self.root_path
+		if self.sock is not None:
+			self.sock.close()
+			self.sock = None
+		self.get_root_info(path, search=search)
+		s = socket.socket()
+		s.connect((socket.inet_ntoa(struct.pack(">I",self.host)),self.port))
+		err, = self.cmd("register", FUSE_REGISTER_BLOB_ACL,REGISTER_TOOLS,self.cuid,*VERSION, sock=s)
+		if err:
+			raise RuntimeError("LizardFS connect error: %d",err)
+		self.sock = s
+
+	CMD = {
+		"register": (CLTOMA_FUSE_REGISTER,Struct(">64sBIHBB"), MATOCL_FUSE_REGISTER,Struct(">B"), 0),
+		"check": (CLTOMA_FUSE_CHECK,Struct(">II"), MATOCL_FUSE_CHECK,Struct(">I"), RETURN_REST),
+		"getgoal": (CLTOMA_FUSE_GETGOAL,Struct(">IIB"), MATOCL_FUSE_GETGOAL,StructV(">I",">pII"), RETURN_REST),
+		"setgoal": (CLTOMA_FUSE_SETGOAL,Struct(">IIIpB"), MATOCL_FUSE_SETGOAL,Struct(">IB"), RETURN_REST),
+	}
+	PREFIX = Struct(">II")
+	def cmd(self, name, *args, sock=None):
+		if sock is None:
+			sock = self.sock
+			retry = True
+		else:
+			retry = False
+
+		cmd_out,pack_out, cmd_in,pack_in, flags = self.CMD[name]
+		buf = pack_out.pack(*args)
+		buf = self.PREFIX.pack(cmd_out, len(buf))+buf
+		sock.sendall(buf)
+
+		buf = recv_all(sock,self.PREFIX.size)
+		if not buf and retry:
+			self.get_root()
+			sock = self.sock
+			sock.sendall(buf)
+			buf = recv_all(sock,self.PREFIX.size)
+		if not buf:
+			raise RuntimeError("disconnected on %s" % (name,))
+		cmd,res_len = self.PREFIX.unpack(buf)
+		if cmd != cmd_in:
+			raise RuntimeError("wrong reply type")
+		buf = recv_all(sock,res_len)
+		if flags & RETURN_REST or isinstance(pack_in, StructV):
+			if len(buf) < pack_in.size:
+				raise RuntimeError("Expected at least %d bytes, got %d" % (pack_in.size,len(buf)))
+			rest = (buf[pack_in.size:],)
+			buf = buf[:pack_in.size]
+		elif len(buf) != pack_in.size:
+			raise RuntimeError("Expected %d bytes, got %d" % (pack_in.size,len(buf)))
+		else:
+			rest = ()
+		return pack_in.unpack(buf) + rest
+
+	def get_counts(self, path, recursive=False):
+		st = os.stat(path, follow_symlinks=False)
+		if st.st_dev != self.devno:
+			raise RuntimeError(path,"is not within the file system")
+		if stat.S_ISDIR(st.st_mode):
+			for f in os.scandir(path):
+				if f.name[0] == '.':
+					continue
+				yield from self.get_counts(f.path, recursive=True)
+			return
+		elif not stat.S_ISREG(st.st_mode):
+			return
+
+		yield (path,self._get_count(st.st_ino))
+	
+	def _get_count(self, ino):
+		seq,buf = self.cmd('check', self.seq,
+			SPECIAL_INODE_ROOT if ino == self.root_inode else ino)
+		if seq != self.seq:
+			raise RuntimeError("Wrong seqnum: x%x vs. x%x" % (self.seq,seq))
+		self.seq += 1
+
+		if len(buf) == 44:
+			res = enumerate(struct.unpack(">11I", buf))
+			res = ( (a,b) for a,b in res if b > 0 )
+		elif not len%3:
+			res = ( struct.unpack(">BH",buf[n:n+2]) for n in range(0,len,3) )
+		else:
+			raise RuntimeError("Response length is %d", len(buf))
+
+		return dict(res)
+
+def reader(end='\n'):
+	p = b""
+	if isinstance(end,str):
+		end = end.encode("utf-8")
+	while True:
+		np = sys.stdin.buffer.read(512)
+		if not np:
+			if p:
+				yield p
+			return
+		p += np
+		while True:
+			i = p.find(end)
+			if i == -1:
+				break
+			if i > 0:
+				try:
+					yield p[:i].decode("utf-8")
+				except UnicodeDecodeError:
+					print(repr(p[:i]), file=sys.stderr)
+			p = p[i+len(end):]
+
+@click.command()
+@click.option("--root", default="", help="Mount point")
+@click.option("--zero_in", "-z", is_flag=True, default=False, help="Read zero-delimited file names")
+@click.option("--zero_out", "-Z", is_flag=True, default=False, help="Write zero-delimited file names")
+@click.option("--recursive", "-r", is_flag=True, default=False, help="Recurse into directories")
+@click.argument('files', nargs=-1)
+def run(root, zero_in, zero_out, recursive, files):
+	r = None
+	if root:
+		r = Lizard(root)
+	if files:
+		fi = iter(files)
+	else:
+		fi = reader(end=('\0' if zero_in else '\n'))
+	for f in fi:
+		if r is None:
+			r = Lizard(f, search=True)
+		for f,res in r.get_counts(f, recursive=recursive):
+			if res.get(0,0) > 0:
+				print(f, end=('\0' if zero_out else '\n'))
+
+if __name__ == '__main__':
+    run()
