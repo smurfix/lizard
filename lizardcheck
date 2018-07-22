@@ -6,7 +6,7 @@
 #Usage:
 #
 ## list all critically-endangered files, i.e. with chunks with exactly one copy
-#find /mnt/lizard -type f -print0 | lizardcheck -n 0 -zb
+#find /mnt/lizard -type f -print0 | lizardcheck -n 1 -z
 #
 ## delete all files with missing chunks
 #find /mnt/lizard -type f -print0 | lizardcheck -n 0 -zZ | xargs -0r rm -f
@@ -37,18 +37,6 @@ CLTOMA_FUSE_CHECK = PROTO_BASE+440
 MATOCL_FUSE_CHECK = PROTO_BASE+441
 
 RETURN_REST = 1
-
-class StructV(Stuct):
-	def __init__(self, prefix,vect):
-		super().__init__(prefix)
-		self._v = Struct(vect)
-
-	def pack(*args):
-		v = args.pop()
-		buf = [ super().pack(*args) ]
-		for ve in v:
-			buf.append(v)
-		return b''.join(buf)
 
 def recv_all(s,l):
 	b=b""
@@ -131,8 +119,8 @@ class Lizard:
 	CMD = {
 		"register": (CLTOMA_FUSE_REGISTER,Struct(">64sBIHBB"), MATOCL_FUSE_REGISTER,Struct(">B"), 0),
 		"check": (CLTOMA_FUSE_CHECK,Struct(">II"), MATOCL_FUSE_CHECK,Struct(">I"), RETURN_REST),
-		"getgoal": (CLTOMA_FUSE_GETGOAL,Struct(">IIB"), MATOCL_FUSE_GETGOAL,StructV(">I",">pII"), RETURN_REST),
-		"setgoal": (CLTOMA_FUSE_SETGOAL,Struct(">IIIpB"), MATOCL_FUSE_SETGOAL,Struct(">IB"), RETURN_REST),
+#		"getgoal": (CLTOMA_FUSE_GETGOAL,Struct(">IIB"), MATOCL_FUSE_GETGOAL,Struct(">I"), RETURN_REST),
+#		"setgoal": (CLTOMA_FUSE_SETGOAL,Struct(">IIIpB"), MATOCL_FUSE_SETGOAL,Struct(">IB"), RETURN_REST),
 	}
 	PREFIX = Struct(">II")
 	def cmd(self, name, *args, sock=None):
@@ -147,19 +135,19 @@ class Lizard:
 		buf = self.PREFIX.pack(cmd_out, len(buf))+buf
 		sock.sendall(buf)
 
-		buf = recv_all(sock,self.PREFIX.size)
-		if not buf and retry:
+		buf2 = recv_all(sock,self.PREFIX.size)
+		if not buf2 and retry:
 			self.get_root()
 			sock = self.sock
 			sock.sendall(buf)
-			buf = recv_all(sock,self.PREFIX.size)
-		if not buf:
+			buf2 = recv_all(sock,self.PREFIX.size)
+		if not buf2:
 			raise RuntimeError("disconnected on %s" % (name,))
-		cmd,res_len = self.PREFIX.unpack(buf)
+		cmd,res_len = self.PREFIX.unpack(buf2)
 		if cmd != cmd_in:
 			raise RuntimeError("wrong reply type")
 		buf = recv_all(sock,res_len)
-		if flags & RETURN_REST or isinstance(pack_in, StructV):
+		if flags & RETURN_REST: # or isinstance(pack_in, StructV):
 			if len(buf) < pack_in.size:
 				raise RuntimeError("Expected at least %d bytes, got %d" % (pack_in.size,len(buf)))
 			rest = (buf[pack_in.size:],)
@@ -170,7 +158,7 @@ class Lizard:
 			rest = ()
 		return pack_in.unpack(buf) + rest
 
-	def get_counts(self, path, recursive=False):
+	def get_counts(self, path, recursive=False, verbose=False):
 		st = os.stat(path, follow_symlinks=False)
 		if st.st_dev != self.devno:
 			raise RuntimeError(path,"is not within the file system")
@@ -178,11 +166,17 @@ class Lizard:
 			for f in os.scandir(path):
 				if f.name[0] == '.':
 					continue
-				yield from self.get_counts(f.path, recursive=True)
+				yield from self.get_counts(f.path, recursive=True, verbose=verbose)
 			return
 		elif not stat.S_ISREG(st.st_mode):
 			return
 
+		if len(path) < 100:
+			p = path
+		else:
+			p = '…'+path[-99:]
+		print("  ",p, " \r", end="", file=sys.stderr)
+		sys.stderr.flush()
 		yield (path,self._get_count(st.st_ino))
 	
 	def _get_count(self, ino):
@@ -229,8 +223,10 @@ def reader(end='\n'):
 @click.option("--zero_in", "-z", is_flag=True, default=False, help="Read zero-delimited file names")
 @click.option("--zero_out", "-Z", is_flag=True, default=False, help="Write zero-delimited file names")
 @click.option("--recursive", "-r", is_flag=True, default=False, help="Recurse into directories")
+@click.option("--verbose", "-v", is_flag=True, default=False, help="Be verbose")
+@click.option("--count", "-n", default=0, help="List files with thunks with this many copies")
 @click.argument('files', nargs=-1)
-def run(root, zero_in, zero_out, recursive, files):
+def run(root, zero_in, zero_out, recursive, files, count, verbose):
 	r = None
 	if root:
 		r = Lizard(root)
@@ -241,9 +237,14 @@ def run(root, zero_in, zero_out, recursive, files):
 	for f in fi:
 		if r is None:
 			r = Lizard(f, search=True)
-		for f,res in r.get_counts(f, recursive=recursive):
-			if res.get(0,0) > 0:
+		for f,res in r.get_counts(f, recursive=recursive, verbose=verbose):
+			if res.get(count,0) > 0:
+				if verbose:
+					print(" "*100+"\r", file=sys.stderr)
+					sys.stderr.flush()
 				print(f, end=('\0' if zero_out else '\n'))
+				if verbose:
+					sys.stdout.flush()
 
 if __name__ == '__main__':
     run()

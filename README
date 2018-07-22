@@ -1,10 +1,10 @@
-lizardcheck: a filter that checks for files with chunks with
-badly-replicated chunks.
+lizardcheck: a filter that finds files with chunks with
+badly-replicated or missing chunks.
 
 Usage:
 
-# list all critically-endangered files, i.e. with chunks with exactly one copy
-find /mnt/lizard -type f -print0 | lizardcheck -n 0 -zb
+# list all endangered files, i.e. with chunks with exactly one copy
+find /mnt/lizard -type f -print0 | lizardcheck -n 1 -zb
 
 # delete all files with missing chunks
 find /mnt/lizard -type f -print0 | lizardcheck -n 0 -zZ | xargs -0r rm -f
